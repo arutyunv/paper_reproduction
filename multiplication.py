@@ -6,36 +6,6 @@ from .base import DatasetItem, Task
 
 
 class MultiplicationTask(Task):
-    """
-    Generator for decimal multiplication.
-
-    Designed for length-generalization experiments where the length of the
-    first operand changes while the second operand remains short.
-
-    Typical setup:
-
-        training / ID:
-            first operand  <= 5 digits
-            second operand <= 3 digits
-
-        OOD:
-            first operand  = 35 digits
-            second operand <= 3 digits
-
-    Prompt layout:
-
-        a_0 ... a_{d-1}  MUL  b_0 ... b_{m-1}  EQ
-
-    Answer layout:
-
-        p_0 ... p_{k-1}
-
-    Numbers are emitted most-significant-digit first.
-
-    Unlike AdditionTask, operands are not padded internally. Padding of the
-    packed sequence is handled by Task.collate().
-    """
-
     PAD_ID = 0
     MUL_ID = 1
     EQ_ID = 2
@@ -47,68 +17,56 @@ class MultiplicationTask(Task):
         self,
         n_digits: int | Tuple[int, int],
         multiplier_digits: int = 3,
-        exact_digits: bool = True,
-        fixed_answer_width: bool = True,
+        reverse: bool = False,
         seed: int | None = 42,
     ):
         """
+        Generator for decimal multiplication.
+
+        Prompt layout:
+            a_0 .. a_{d-1}  MUL  b_0 .. b_{m-1}  EQ
+
+        Answer layout:
+            p_0 .. p_{d+m-1}
+
+        The first operand has exactly ``d`` digits, where ``d`` is either fixed
+        by ``n_digits`` or sampled from [n_digits[0], n_digits[1]).
+
+        The second operand has exactly ``multiplier_digits`` digits.
+
+        The answer always has exactly ``d + multiplier_digits`` digit tokens,
+        with leading zeros when necessary. This prevents answer length from
+        leaking information about the product.
+
+        Examples
+        --------
+        ID training:
+            MultiplicationTask(n_digits=5, multiplier_digits=3)
+
+        OOD evaluation:
+            MultiplicationTask(n_digits=35, multiplier_digits=3)
+
+        Variable-length evaluation:
+            MultiplicationTask(n_digits=(5, 36), multiplier_digits=3)
+
         Parameters
         ----------
         n_digits:
-            Length of the first operand.
-
-            If int:
-                exact_digits=True:
-                    sample exactly n_digits digits.
-
-                exact_digits=False:
-                    sample a positive integer with at most n_digits digits.
-
-            If tuple (lo, hi):
-                sample the first-operand length uniformly from [lo, hi).
+            Digits in the first operand. Fixed if an integer, or sampled from
+            [lo, hi) if a tuple.
 
         multiplier_digits:
-            Maximum number of digits of the second operand.
+            Number of digits in the second operand.
 
-            The second operand is sampled uniformly from
-
-                1 <= b < 10**multiplier_digits.
-
-            Thus multiplier_digits=3 corresponds to b in [1, 999].
-
-        exact_digits:
-            Controls the integer n_digits case only.
-
-            True:
-                n_digits=5 -> exactly 5-digit first operands.
-
-            False:
-                n_digits=5 -> first operands with at most 5 digits.
-
-            For the paper-style short training distribution, use False.
-
-            For a controlled 35-digit OOD set, use True.
-
-        fixed_answer_width:
-            If True, left-pad the product with zero digits to the maximum
-            possible product width:
-
-                max first-operand digits + multiplier_digits.
-
-            This prevents answer length from leaking information about the
-            numerical result and makes answer length deterministic for a
-            given task configuration.
+        reverse:
+            If True, emit operands and answer least-significant-digit first.
 
         seed:
-            RNG seed.
+            Randomization seed. None gives non-reproducible sampling.
         """
         self.n_digits = n_digits
         self.multiplier_digits = multiplier_digits
-        self.exact_digits = exact_digits
-        self.fixed_answer_width = fixed_answer_width
-
-        if multiplier_digits < 1:
-            raise ValueError("multiplier_digits must be >= 1")
+        self.reverse = reverse
 
         if isinstance(n_digits, int):
             if n_digits < 1:
@@ -120,10 +78,11 @@ class MultiplicationTask(Task):
                     "n_digits tuple must satisfy 1 <= lo < hi"
                 )
 
+        if multiplier_digits < 1:
+            raise ValueError("multiplier_digits must be >= 1")
+
         self.n_special = self.N_SPECIAL
-        self.d_token_ids = (
-            np.arange(self.BASE, dtype=np.int64) + self.n_special
-        )
+        self.d_token_ids = np.arange(self.BASE) + self.n_special
 
         self.rng = np.random.default_rng(seed)
 
@@ -133,212 +92,186 @@ class MultiplicationTask(Task):
 
     @property
     def max_digits(self) -> int:
-        """Maximum possible length of the first operand."""
         if isinstance(self.n_digits, int):
             return self.n_digits
-
         return self.n_digits[1] - 1
-
-    @property
-    def max_answer_digits(self) -> int:
-        """
-        Maximum product width.
-
-        A d-digit number times an m-digit number has at most d + m digits.
-        """
-        return self.max_digits + self.multiplier_digits
 
     @property
     def min_block_size(self) -> int:
         """
-        Smallest block_size accepted by Task.collate().
+        Smallest block_size accepted by ``Task.collate``.
 
-        Longest prompt:
+        For first-operand length d and multiplier length m:
 
-            d + 1 + m + 1
-              = d + m + 2
+            prompt:
+                d digits + MUL + m digits + EQ
+                = d + m + 2
 
-        where the two extra tokens are MUL and EQ.
+            answer:
+                d + m digits
 
-        Longest answer:
+            total:
+                2d + 2m + 2
 
-            d + m
+        ``collate`` requires
 
-        Therefore
+            len(prompt) + len(answer) <= block_size + 1
 
-            len(prompt) + len(answer)
-                = 2d + 2m + 2
+        so
 
-        and base.py requires
-
-            len(prompt) + len(answer) <= block_size + 1.
+            block_size >= 2d + 2m + 1.
         """
-        max_sequence_length = (
+        return (
             2 * self.max_digits
             + 2 * self.multiplier_digits
-            + 2
+            + 1
         )
-
-        return max_sequence_length - 1
 
     def metrics(self, predicted, targets):
         """
-        Exact-match accuracy plus token-level answer accuracy.
+        Exact-match accuracy plus per-digit answer accuracy.
         """
         scores = super().metrics(predicted, targets)
 
-        answer_mask = targets != -1
+        answer = targets != -1
 
-        if answer_mask.any():
-            scores["digit_acc"] = float(
-                (predicted == targets)[answer_mask]
-                .astype(np.float32)
-                .mean()
-            )
-        else:
-            scores["digit_acc"] = 0.0
+        scores["digit_acc"] = float(
+            (predicted == targets)[answer]
+            .astype(np.float32)
+            .mean()
+        )
 
         return scores
 
-    def _sample_first_length(self) -> int:
-        """Choose the number of digits of the first operand."""
-        if isinstance(self.n_digits, tuple):
-            lo, hi = self.n_digits
-            return int(self.rng.integers(lo, hi))
-
-        if self.exact_digits:
+    def _sample_n_digits(self) -> int:
+        """
+        Sample the length of the first operand.
+        """
+        if isinstance(self.n_digits, int):
             return self.n_digits
 
-        # Sampling the integer itself uniformly below 10**n is the
-        # paper-style distribution. Its digit length is therefore not
-        # uniform over 1,...,n.
-        return -1
-
-    def _sample_first_operand(self) -> int:
-        """Sample the first operand."""
-        d = self._sample_first_length()
-
-        if d == -1:
-            # At most self.n_digits digits.
-            return int(
-                self.rng.integers(
-                    1,
-                    10**self.n_digits,
-                )
-            )
-
-        lower = 1 if d == 1 else 10 ** (d - 1)
-        upper = 10**d
-
         return int(
             self.rng.integers(
-                lower,
-                upper,
+                self.n_digits[0],
+                self.n_digits[1],
             )
         )
 
-    def _sample_second_operand(self) -> int:
+    def _sample_digits(self, n: int) -> np.ndarray:
         """
-        Sample the short second operand.
+        Sample an exactly n-digit positive decimal integer as an MSB-first
+        digit array.
 
-        multiplier_digits=3 gives a uniform draw from 1,...,999.
+        The most-significant digit is sampled from 1..9, so leading zeros
+        are not allowed.
         """
-        return int(
-            self.rng.integers(
-                1,
-                10**self.multiplier_digits,
-            )
-        )
-
-    @staticmethod
-    def _digits(value: int) -> np.ndarray:
-        """Positive integer -> MSB-first decimal digit array."""
-        if value <= 0:
-            raise ValueError("Expected a positive integer")
-
-        return np.fromiter(
-            (ord(c) - ord("0") for c in str(value)),
+        digits = self.rng.integers(
+            0,
+            self.BASE,
+            size=n,
             dtype=np.int64,
         )
 
-    def _encode_digits(self, digits: np.ndarray) -> np.ndarray:
-        """Decimal digits -> vocabulary token IDs."""
-        return self.d_token_ids[digits].astype(np.int64)
+        digits[0] = self.rng.integers(
+            1,
+            self.BASE,
+        )
 
-    def _encode_number(self, value: int) -> np.ndarray:
-        """Positive integer -> MSB-first token sequence."""
-        return self._encode_digits(self._digits(value))
+        return digits
 
-    def _encode_product(self, product: int) -> np.ndarray:
+    def _multiply_digits(
+        self,
+        a: np.ndarray,
+        b: np.ndarray,
+    ) -> np.ndarray:
         """
-        Encode the multiplication result.
+        Multiply two MSB-first decimal digit arrays.
 
-        When fixed_answer_width=True, prepend zero DIGITS until the answer
-        has max_answer_digits positions.
+        Returns an MSB-first array of fixed length
 
-        These are digit-zero tokens, not PAD tokens, because they are part
-        of the supervised answer.
+            len(a) + len(b).
+
+        The implementation uses grade-school multiplication rather than
+        converting the operands to NumPy integers. This avoids overflow for
+        long OOD examples such as 35-digit operands.
+
+        Leading zeros in the output are retained so answer length depends
+        only on operand lengths.
+
+        Example
+        -------
+        123 * 45 = 5535
+
+        Since 3-digit x 2-digit multiplication has maximum width 5:
+
+            [1, 2, 3] * [4, 5]
+                -> [0, 5, 5, 3, 5]
         """
-        digits = self._digits(product)
+        da = len(a)
+        db = len(b)
 
-        if self.fixed_answer_width:
-            width = self.max_answer_digits
+        out = np.zeros(
+            da + db,
+            dtype=np.int64,
+        )
 
-            if len(digits) > width:
-                raise ValueError(
-                    f"Product needs {len(digits)} digits but configured "
-                    f"answer width is only {width}"
-                )
+        # Standard grade-school multiplication.
+        for i in range(da - 1, -1, -1):
+            for j in range(db - 1, -1, -1):
+                out[i + j + 1] += int(a[i]) * int(b[j])
 
-            if len(digits) < width:
-                digits = np.concatenate(
-                    [
-                        np.zeros(
-                            width - len(digits),
-                            dtype=np.int64,
-                        ),
-                        digits,
-                    ]
-                )
+        # Propagate carries from right to left.
+        for k in range(len(out) - 1, 0, -1):
+            carry = int(out[k]) // self.BASE
 
-        return self._encode_digits(digits)
+            out[k] %= self.BASE
+            out[k - 1] += carry
+
+        # The maximum product of a d-digit and m-digit number fits in
+        # d + m digits, so the first position must now also be a digit.
+        if out[0] >= self.BASE:
+            raise RuntimeError(
+                "Internal multiplication error: carry overflow"
+            )
+
+        return out
 
     def _sample_one(self) -> DatasetItem:
-        a = self._sample_first_operand()
-        b = self._sample_second_operand()
+        # Length controlling the generalization experiment.
+        d = self._sample_n_digits()
 
-        product = a * b
+        # Exactly d digits.
+        a = self._sample_digits(d)
 
-        a_tokens = self._encode_number(a)
-        b_tokens = self._encode_number(b)
+        # Exactly multiplier_digits digits.
+        b = self._sample_digits(self.multiplier_digits)
+
+        # Fixed-width product of length d + multiplier_digits.
+        product = self._multiply_digits(a, b)
+
+        if self.reverse:
+            a = a[::-1]
+            b = b[::-1]
+            product = product[::-1]
 
         prompt = np.concatenate(
             [
-                a_tokens,
-                np.array([self.MUL_ID], dtype=np.int64),
-                b_tokens,
-                np.array([self.EQ_ID], dtype=np.int64),
+                self.d_token_ids[a],
+                np.array([self.MUL_ID]),
+                self.d_token_ids[b],
+                np.array([self.EQ_ID]),
             ]
-        )
+        ).astype(np.int64)
 
-        answer = self._encode_product(product)
+        answer = self.d_token_ids[product].astype(np.int64)
 
         return DatasetItem(
-            prompt=prompt.astype(np.int64),
-            answer=answer.astype(np.int64),
+            prompt=prompt,
+            answer=answer,
             metadata={
-                "a": a,
-                "b": b,
-                "product": product,
-                "n_digits": len(str(a)),
-                "multiplier_digits": len(str(b)),
-                "max_digits": self.max_digits,
-                "max_multiplier_digits": self.multiplier_digits,
-                "length_group": (
-                    "LONG"
-                    if len(str(a)) > 5
-                    else "SHORT"
-                ),
+                "n_digits": d,
+                "multiplier_digits": self.multiplier_digits,
+                "length_group": "LONG" if d > 5 else "SHORT",
                 "variant": "MULT",
             },
         )
